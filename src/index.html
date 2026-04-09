@@ -39,6 +39,10 @@
     </div>
 
     <div class="section">
+      <button id="manual-toggle-btn" class="btn btn-toggle-main" data-i18n="toggle">Toggle</button>
+    </div>
+
+    <div class="section">
       <label data-i18n="monitors">Monitors:</label>
       <div id="monitor-list" class="monitor-list"></div>
     </div>
@@ -48,7 +52,7 @@
         <label data-i18n="gamma">Gamma</label>
         <div class="slider-wrap">
           <input type="range" id="gamma" min="0.1" max="10.0" step="0.01" value="1.0">
-          <div class="slider-center-mark" style="left: calc((1.0 - 0.1) / (10.0 - 0.1) * 100%)"></div>
+          <div class="slider-center-mark"></div>
         </div>
         <span id="gamma-val" class="slider-val">1.00</span>
       </div>
@@ -56,7 +60,7 @@
         <label data-i18n="brightness">Brightness</label>
         <div class="slider-wrap">
           <input type="range" id="brightness" min="0.0" max="1.0" step="0.01" value="0.5">
-          <div class="slider-center-mark" style="left: 50%"></div>
+          <div class="slider-center-mark"></div>
         </div>
         <span id="brightness-val" class="slider-val">0.50</span>
       </div>
@@ -64,7 +68,7 @@
         <label data-i18n="contrast">Contrast</label>
         <div class="slider-wrap">
           <input type="range" id="contrast" min="0.0" max="1.0" step="0.01" value="0.5">
-          <div class="slider-center-mark" style="left: 50%"></div>
+          <div class="slider-center-mark"></div>
         </div>
         <span id="contrast-val" class="slider-val">0.50</span>
       </div>
@@ -83,47 +87,24 @@
     const { invoke, listen } = window.__TAURI__.core;
 
     const SNAP_DIST = 0.04;
+    const defaults = { gamma: 1.0, brightness: 0.5, contrast: 0.5 };
 
     let lang = 'en';
-    let waitingForKey = null;
-    let keyScanInterval = null;
-
-    const defaults = {
-      gamma: 1.0,
-      brightness: 0.5,
-      contrast: 0.5,
-    };
 
     const i18n = {
       en: {
-        autoMode: 'Auto mode',
-        bind: 'Bind:',
-        process: 'Process:',
-        toggleBind: 'Toggle bind:',
-        monitors: 'Monitors:',
-        gamma: 'Gamma',
-        brightness: 'Brightness',
-        contrast: 'Contrast',
-        reset: 'Reset',
-        waiting: 'Waiting..',
-        active: 'Active..',
-        listening: '...',
-        keyLabel: key => formatKey(key),
+        autoMode: 'Auto mode', bind: 'Bind:', process: 'Process:',
+        toggleBind: 'Toggle bind:', monitors: 'Monitors:',
+        gamma: 'Gamma', brightness: 'Brightness', contrast: 'Contrast',
+        reset: 'Reset', waiting: 'Waiting..', active: 'Active..',
+        toggle: 'Toggle', listening: 'Press any key...',
       },
       ru: {
-        autoMode: 'Авто-режим',
-        bind: 'Бинд:',
-        process: 'Процесс:',
-        toggleBind: 'Бинд вкл/выкл:',
-        monitors: 'Мониторы:',
-        gamma: 'Гамма',
-        brightness: 'Яркость',
-        contrast: 'Контрастность',
-        reset: 'Сброс',
-        waiting: 'Жду..',
-        active: 'Работаю..',
-        listening: '...',
-        keyLabel: key => formatKey(key),
+        autoMode: 'Авто-режим', bind: 'Бинд:', process: 'Процесс:',
+        toggleBind: 'Бинд вкл/выкл:', monitors: 'Мониторы:',
+        gamma: 'Гамма', brightness: 'Яркость', contrast: 'Контрастность',
+        reset: 'Сброс', waiting: 'Жду..', active: 'Работаю..',
+        toggle: 'Вкл/Выкл', listening: 'Нажмите клавишу...',
       },
     };
 
@@ -144,6 +125,8 @@
         const key = el.getAttribute('data-i18n');
         if (i18n[l][key]) el.textContent = i18n[l][key];
       });
+      const toggleBtn = document.getElementById('manual-toggle-btn');
+      if (toggleBtn) toggleBtn.textContent = i18n[l].toggle;
     }
 
     function setStatus(active) {
@@ -154,37 +137,31 @@
       el.querySelector('span:last-child').textContent = i18n[lang][key];
     }
 
-    function startKeyBinding(btnId) {
-      waitingForKey = btnId;
+    function setBindButtonListening(target) {
+      const btnId = target === 'toggle' ? 'toggle-bind-btn' : 'auto-bind-btn';
       const btn = document.getElementById(btnId);
       btn.textContent = i18n[lang].listening;
       btn.classList.add('listening');
 
-      keyScanInterval = setInterval(async () => {
-        const code = await invoke('scan_key');
-        if (code !== null) {
-          const label = formatKey(code);
-          btn.textContent = label;
+      const handler = (event) => {
+        const { target: t, code } = event.payload;
+        if (t === target) {
+          btn.textContent = formatKey(code);
           btn.classList.remove('listening');
-
-          if (btnId === 'toggle-bind-btn') {
-            await invoke('set_toggle_key', { key: code });
-          } else {
-            await invoke('set_auto_key', { key: code });
-          }
-          clearInterval(keyScanInterval);
-          keyScanInterval = null;
-          waitingForKey = null;
+          listenCleanup();
         }
-      }, 50);
+      };
+      const listenCleanup = listen('key_captured', handler);
     }
 
     document.getElementById('toggle-bind-btn').addEventListener('click', () => {
-      if (!waitingForKey) startKeyBinding('toggle-bind-btn');
+      invoke('start_key_capture', { target: 'toggle' });
+      setBindButtonListening('toggle');
     });
 
     document.getElementById('auto-bind-btn').addEventListener('click', () => {
-      if (!waitingForKey) startKeyBinding('auto-bind-btn');
+      invoke('start_key_capture', { target: 'auto' });
+      setBindButtonListening('auto');
     });
 
     document.getElementById('lang-en').addEventListener('click', () => setLang('en'));
@@ -201,20 +178,11 @@
         item.className = 'monitor-item';
         const checked = m.is_primary ? 'checked' : '';
         item.innerHTML = `
-          <input type="checkbox" value="${m.name}" ${checked} onchange="updateMonitorSelection()">
+          <input type="checkbox" value="${m.name}" ${checked} onchange="sendSettings()">
           <span>${m.label}</span>
         `;
         list.appendChild(item);
       });
-      updateMonitorSelection();
-    }
-
-    function updateMonitorSelection() {
-      const selected = [];
-      document.querySelectorAll('#monitor-list input[type="checkbox"]').forEach(cb => {
-        if (cb.checked) selected.push(cb.value);
-      });
-      sendSettings();
     }
 
     function getSelectedMonitors() {
@@ -239,74 +207,28 @@
       });
     }
 
-    function magnetValue(raw, center) {
-      const diff = Math.abs(raw - center);
-      if (diff < SNAP_DIST) return center;
-      return raw;
+    function magnetizeValue(raw, center) {
+      return Math.abs(raw - center) < SNAP_DIST ? center : raw;
     }
 
     const gammaSlider = document.getElementById('gamma');
     const brightnessSlider = document.getElementById('brightness');
     const contrastSlider = document.getElementById('contrast');
 
-    let sliderDragging = null;
-    let sliderStartValues = {};
-
     [gammaSlider, brightnessSlider, contrastSlider].forEach(slider => {
-      slider.addEventListener('mousedown', (e) => {
-        sliderDragging = e.target.id;
-        sliderStartValues = {
-          gamma: parseFloat(gammaSlider.value),
-          brightness: parseFloat(brightnessSlider.value),
-          contrast: parseFloat(contrastSlider.value),
-        };
-      });
-
       slider.addEventListener('input', () => {
-        const g = parseFloat(gammaSlider.value);
-        const b = parseFloat(brightnessSlider.value);
-        const c = parseFloat(contrastSlider.value);
-
-        document.getElementById('gamma-val').textContent = g.toFixed(2);
-        document.getElementById('brightness-val').textContent = b.toFixed(2);
-        document.getElementById('contrast-val').textContent = c.toFixed(2);
+        const id = slider.id;
+        document.getElementById(id + '-val').textContent = parseFloat(slider.value).toFixed(2);
       });
 
-      slider.addEventListener('mouseup', () => {
-        if (sliderDragging === slider.id) {
-          let raw = parseFloat(slider.value);
-          let center, min, max;
-          if (slider.id === 'gamma') {
-            center = defaults.gamma; min = 0.1; max = 10.0;
-          } else {
-            center = 0.5; min = 0.0; max = 1.0;
-          }
-          const magnetized = magnetValue(raw, center);
-          slider.value = magnetized;
-
-          document.getElementById(slider.id + '-val').textContent = magnetized.toFixed(2);
-          sliderDragging = null;
-          sendSettings();
-        }
-      });
-    });
-
-    document.addEventListener('mouseup', () => {
-      if (sliderDragging) {
-        const slider = document.getElementById(sliderDragging);
+      slider.addEventListener('change', () => {
         let raw = parseFloat(slider.value);
-        let center;
-        if (sliderDragging === 'gamma') {
-          center = defaults.gamma;
-        } else {
-          center = 0.5;
-        }
-        const magnetized = magnetValue(raw, center);
+        const center = slider.id === 'gamma' ? defaults.gamma : 0.5;
+        const magnetized = magnetizeValue(raw, center);
         slider.value = magnetized;
-        document.getElementById(sliderDragging + '-val').textContent = magnetized.toFixed(2);
-        sliderDragging = null;
+        document.getElementById(slider.id + '-val').textContent = magnetized.toFixed(2);
         sendSettings();
-      }
+      });
     });
 
     document.getElementById('auto-mode').addEventListener('change', (e) => {
@@ -315,6 +237,10 @@
 
     document.getElementById('target-process').addEventListener('change', (e) => {
       invoke('set_target_process', { target: e.target.value });
+    });
+
+    document.getElementById('manual-toggle-btn').addEventListener('click', () => {
+      invoke('toggle');
     });
 
     document.getElementById('reset-btn').addEventListener('click', () => {
@@ -326,16 +252,11 @@
       document.getElementById('contrast-val').textContent = defaults.contrast.toFixed(2);
       sendSettings();
       invoke('restore_all');
-      setStatus(false);
     });
 
     async function init() {
+      setLang('en');
       await loadMonitors();
-
-      const state = await invoke('get_state');
-      document.getElementById('toggle-bind-btn').textContent = formatKey(state.toggle_key);
-      document.getElementById('auto-bind-btn').textContent = formatKey(state.auto_key);
-      setStatus(state.is_active);
 
       listen('status_change', (e) => setStatus(e.payload));
       listen('auto_mode_change', (e) => {

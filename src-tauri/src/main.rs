@@ -22,6 +22,7 @@ use winapi::um::winuser::{
 
 type GammaRamp = [u16; 768];
 const FADE_STEPS: u32 = 40;
+const TICK_MS: u64 = 50;
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -34,19 +35,19 @@ struct MonitorInfo {
     label: String,
 }
 
-#[derive(Clone, Serialize)]
-struct StateResponse {
-    is_active: bool,
-    toggle_key: i32,
-    auto_key: i32,
-}
-
 #[derive(Deserialize)]
 struct ApplySettings {
     gamma: f32,
     brightness: f32,
     contrast: f32,
     selected_monitors: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum KeyCapture {
+    None,
+    Toggle,
+    Auto,
 }
 
 struct AppData {
@@ -65,10 +66,10 @@ struct AppData {
     auto_mode: bool,
     target_process: String,
     last_auto_state: Option<bool>,
-    waiting_for_toggle_key: bool,
-    waiting_for_auto_key: bool,
+    key_capture: KeyCapture,
 }
 
+#[allow(dead_code)]
 impl AppData {
     fn new() -> Self {
         Self {
@@ -87,8 +88,7 @@ impl AppData {
             auto_mode: false,
             target_process: "RustClient.exe".to_string(),
             last_auto_state: None,
-            waiting_for_toggle_key: false,
-            waiting_for_auto_key: false,
+            key_capture: KeyCapture::None,
         }
     }
 }
@@ -194,18 +194,19 @@ fn apply_ramp_to_device(ramp: &GammaRamp, device_name: &str) {
     }
 }
 
-fn save_original_ramps(original_ramps: &mut HashMap<String, GammaRamp>, devices: &[String]) {
-    for name in devices {
-        if original_ramps.contains_key(name) {
-            continue;
-        }
+fn ensure_originals(d: &mut AppData) {
+    if !d.original_ramps.is_empty() {
+        return;
+    }
+    let monitors = enumerate_monitors();
+    for info in &monitors {
         unsafe {
-            let wide = to_wide(name);
+            let wide = to_wide(&info.name);
             let hdc = CreateDCW(null_mut(), wide.as_ptr(), null_mut(), null_mut());
             if !hdc.is_null() {
                 let mut current: GammaRamp = [0; 768];
                 if GetDeviceGammaRamp(hdc, current.as_mut_ptr() as *mut _) != 0 {
-                    original_ramps.insert(name.clone(), current);
+                    d.original_ramps.insert(info.name.clone(), current);
                 }
                 DeleteDC(hdc);
             }
@@ -213,39 +214,146 @@ fn save_original_ramps(original_ramps: &mut HashMap<String, GammaRamp>, devices:
     }
 }
 
-fn apply_to_monitors(
-    ramp: &GammaRamp,
-    selected: &[String],
-    original_ramps: &mut HashMap<String, GammaRamp>,
-) {
-    let all_monitors = enumerate_monitors();
-    let devices: Vec<String> = if selected.is_empty() {
-        all_monitors.iter().map(|m| m.name.clone()).collect()
+fn get_devices(d: &AppData) -> Vec<String> {
+    if d.selected_monitors.is_empty() {
+        enumerate_monitors().into_iter().map(|m| m.name).collect()
     } else {
-        selected.to_vec()
-    };
-
-    save_original_ramps(original_ramps, &devices);
-
-    for info in &all_monitors {
-        if devices.contains(&info.name) {
-            apply_ramp_to_device(ramp, &info.name);
-        }
+        d.selected_monitors.clone()
     }
 }
 
-fn restore_originals(selected: &[String], original_ramps: &HashMap<String, GammaRamp>) {
-    let all_monitors = enumerate_monitors();
-    let devices: Vec<String> = if selected.is_empty() {
-        all_monitors.iter().map(|m| m.name.clone()).collect()
+fn activate_internal(d: &mut AppData, app: &tauri::AppHandle) {
+    if d.is_active {
+        return;
+    }
+    ensure_originals(d);
+
+    let from = d.original_ramps.values().next().copied().unwrap_or(calculate_ramp(1.0, 0.5, 0.5));
+    d.fade_from = Some(from);
+    d.fade_to = Some(d.cached_ramp);
+    d.fade_step = 0;
+    d.is_fading = true;
+    d.is_active = true;
+
+    let _ = app.emit("status_change", true);
+}
+
+fn deactivate_internal(d: &mut AppData, app: &tauri::AppHandle) {
+    if !d.is_active {
+        return;
+    }
+    ensure_originals(d);
+
+    let current = if d.is_fading {
+        match (&d.fade_from, &d.fade_to) {
+            (Some(from), Some(to)) => lerp_ramp(from, to, d.fade_step as f32 / FADE_STEPS as f32),
+            _ => d.cached_ramp,
+        }
     } else {
-        selected.to_vec()
+        d.cached_ramp
     };
 
-    for info in &all_monitors {
-        if devices.contains(&info.name) {
-            if let Some(original) = original_ramps.get(&info.name) {
-                apply_ramp_to_device(original, &info.name);
+    if let Some(original) = d.original_ramps.values().next().copied() {
+        d.fade_from = Some(current);
+        d.fade_to = Some(original);
+        d.fade_step = 0;
+        d.is_fading = true;
+    } else {
+        let devices = get_devices(d);
+        for name in &devices {
+            if let Some(orig) = d.original_ramps.get(name) {
+                apply_ramp_to_device(orig, name);
+            }
+        }
+    }
+    d.is_active = false;
+
+    let _ = app.emit("status_change", false);
+}
+
+fn tick(d: &mut AppData, app: &tauri::AppHandle) {
+    // Key capture mode: scan all keys for binding
+    if !matches!(d.key_capture, KeyCapture::None) {
+        for code in 8..255 {
+            if unsafe { GetAsyncKeyState(code) } as u16 & 0x8000 != 0 {
+                match d.key_capture {
+                    KeyCapture::Toggle => {
+                        d.toggle_key = code;
+                        let _ = app.emit("key_captured", serde_json::json!({"target": "toggle", "code": code}));
+                    }
+                    KeyCapture::Auto => {
+                        d.auto_key = code;
+                        let _ = app.emit("key_captured", serde_json::json!({"target": "auto", "code": code}));
+                    }
+                    KeyCapture::None => {}
+                }
+                d.key_capture = KeyCapture::None;
+                break;
+            }
+        }
+        return; // skip hotkey checks while capturing
+    }
+
+    // Fade
+    if d.is_fading {
+        if d.fade_step >= FADE_STEPS {
+            if let Some(to) = d.fade_to {
+                let devices = get_devices(d);
+                for name in &devices {
+                    apply_ramp_to_device(&to, name);
+                }
+            }
+            d.fade_from = None;
+            d.fade_to = None;
+            d.fade_step = 0;
+            d.is_fading = false;
+        } else {
+            let t = d.fade_step as f32 / FADE_STEPS as f32;
+            let ramp = lerp_ramp(
+                &d.fade_from.unwrap_or(d.cached_ramp),
+                &d.fade_to.unwrap_or(d.cached_ramp),
+                t,
+            );
+            let devices = get_devices(d);
+            for name in &devices {
+                apply_ramp_to_device(&ramp, name);
+            }
+            d.fade_step += 1;
+        }
+    }
+
+    // Toggle hotkey
+    let toggle_down = unsafe { GetAsyncKeyState(d.toggle_key) } as u16 & 0x8000 != 0;
+    if toggle_down && !d.last_toggle {
+        if d.is_active {
+            deactivate_internal(d, app);
+        } else {
+            activate_internal(d, app);
+        }
+    }
+    d.last_toggle = toggle_down;
+
+    // Auto hotkey
+    let auto_down = unsafe { GetAsyncKeyState(d.auto_key) } as u16 & 0x8000 != 0;
+    if auto_down && !d.last_auto {
+        d.auto_mode = !d.auto_mode;
+        if !d.auto_mode && d.is_active {
+            deactivate_internal(d, app);
+        }
+        let _ = app.emit("auto_mode_change", d.auto_mode);
+    }
+    d.last_auto = auto_down;
+
+    // Auto mode: check foreground process
+    if d.auto_mode {
+        let proc = get_foreground_process();
+        let is_target = !proc.is_empty() && proc.eq_ignore_ascii_case(&d.target_process);
+        if d.last_auto_state != Some(is_target) {
+            d.last_auto_state = Some(is_target);
+            if is_target {
+                activate_internal(d, app);
+            } else {
+                deactivate_internal(d, app);
             }
         }
     }
@@ -257,27 +365,14 @@ fn get_monitors() -> Vec<MonitorInfo> {
 }
 
 #[tauri::command]
-fn get_state(data: State<Mutex<AppData>>) -> StateResponse {
-    let d = data.lock().unwrap();
-    StateResponse {
-        is_active: d.is_active,
-        toggle_key: d.toggle_key,
-        auto_key: d.auto_key,
-    }
-}
-
-#[tauri::command]
-fn apply_settings(settings: ApplySettings, data: State<Mutex<AppData>>) {
+fn apply_settings(settings: ApplySettings, data: State<Mutex<AppData>>, _app: tauri::AppHandle) {
     let mut d = data.lock().unwrap();
     d.selected_monitors = settings.selected_monitors;
     d.cached_ramp = calculate_ramp(settings.gamma, settings.brightness, settings.contrast);
-
     if d.is_active {
         let current = if d.is_fading {
             match (&d.fade_from, &d.fade_to) {
-                (Some(from), Some(to)) => {
-                    lerp_ramp(from, to, d.fade_step as f32 / FADE_STEPS as f32)
-                }
+                (Some(from), Some(to)) => lerp_ramp(from, to, d.fade_step as f32 / FADE_STEPS as f32),
                 _ => d.cached_ramp,
             }
         } else {
@@ -291,24 +386,29 @@ fn apply_settings(settings: ApplySettings, data: State<Mutex<AppData>>) {
 }
 
 #[tauri::command]
-fn set_toggle_key(key: i32, data: State<Mutex<AppData>>) {
+fn start_key_capture(target: String, data: State<Mutex<AppData>>) {
     let mut d = data.lock().unwrap();
-    d.toggle_key = key;
+    d.key_capture = match target.as_str() {
+        "toggle" => KeyCapture::Toggle,
+        "auto" => KeyCapture::Auto,
+        _ => KeyCapture::None,
+    };
 }
 
 #[tauri::command]
-fn set_auto_key(key: i32, data: State<Mutex<AppData>>) {
+fn cancel_key_capture(data: State<Mutex<AppData>>) {
     let mut d = data.lock().unwrap();
-    d.auto_key = key;
+    d.key_capture = KeyCapture::None;
 }
 
 #[tauri::command]
-fn set_auto_mode(enabled: bool, data: State<Mutex<AppData>>) {
+fn set_auto_mode(enabled: bool, data: State<Mutex<AppData>>, app: tauri::AppHandle) {
     let mut d = data.lock().unwrap();
     d.auto_mode = enabled;
     if !enabled && d.is_active {
-        d.last_auto_state = None;
+        deactivate_internal(&mut d, &app);
     }
+    d.last_auto_state = None;
 }
 
 #[tauri::command]
@@ -318,179 +418,51 @@ fn set_target_process(target: String, data: State<Mutex<AppData>>) {
 }
 
 #[tauri::command]
-fn toggle(data: State<Mutex<AppData>>) -> bool {
+fn toggle(data: State<Mutex<AppData>>, app: tauri::AppHandle) {
     let mut d = data.lock().unwrap();
     if d.is_active {
-        deactivate_internal(&mut d);
-        false
+        deactivate_internal(&mut d, &app);
     } else {
-        activate_internal(&mut d);
-        true
+        activate_internal(&mut d, &app);
     }
 }
 
 #[tauri::command]
-fn scan_key() -> Option<i32> {
-    for code in 8..255 {
-        if unsafe { GetAsyncKeyState(code) } as u16 & 0x8000 != 0 {
-            return Some(code);
-        }
-    }
-    None
-}
-
-#[tauri::command]
-fn tick(data: State<Mutex<AppData>>, app: tauri::AppHandle) {
+fn restore_all(data: State<Mutex<AppData>>, app: tauri::AppHandle) {
     let mut d = data.lock().unwrap();
-
-    // Fade
-    if d.is_fading {
-        if d.fade_step >= FADE_STEPS {
-            if let Some(to) = d.fade_to {
-                let selected = d.selected_monitors.clone();
-                let _ = d.original_ramps;
-                apply_to_monitors(&to, &selected, &mut d.original_ramps);
-            }
-            d.fade_from = None;
-            d.fade_to = None;
-            d.fade_step = 0;
-            d.is_fading = false;
-        } else {
-            let t = d.fade_step as f32 / FADE_STEPS as f32;
-            let ramp = lerp_ramp(
-                &d.fade_from.unwrap_or(d.cached_ramp),
-                &d.fade_to.unwrap_or(d.cached_ramp),
-                t,
-            );
-            let selected = d.selected_monitors.clone();
-            apply_to_monitors(&ramp, &selected, &mut d.original_ramps);
-            d.fade_step += 1;
+    let devices = get_devices(&d);
+    for name in &devices {
+        if let Some(orig) = d.original_ramps.get(name) {
+            apply_ramp_to_device(orig, name);
         }
     }
-
-    // Toggle hotkey
-    let toggle_down = unsafe { GetAsyncKeyState(d.toggle_key) } as u16 & 0x8000 != 0;
-    if toggle_down && !d.last_toggle && !d.waiting_for_toggle_key && !d.waiting_for_auto_key {
-        if d.is_active {
-            deactivate_internal(&mut d);
-        } else {
-            activate_internal(&mut d);
-        }
-        let _ = app.emit("status_change", d.is_active);
-    }
-    d.last_toggle = toggle_down;
-
-    // Auto hotkey
-    let auto_down = unsafe { GetAsyncKeyState(d.auto_key) } as u16 & 0x8000 != 0;
-    if auto_down && !d.last_auto && !d.waiting_for_toggle_key && !d.waiting_for_auto_key {
-        d.auto_mode = !d.auto_mode;
-        if !d.auto_mode {
-            d.last_auto_state = None;
-            if d.is_active {
-                deactivate_internal(&mut d);
-            }
-        }
-        let _ = app.emit("auto_mode_change", d.auto_mode);
-    }
-    d.last_auto = auto_down;
-
-    // Auto mode check
-    if d.auto_mode {
-        let proc = get_foreground_process();
-        let is_target = !proc.is_empty() && proc.eq_ignore_ascii_case(&d.target_process);
-        if d.last_auto_state != Some(is_target) {
-            d.last_auto_state = Some(is_target);
-            if is_target {
-                activate_internal(&mut d);
-            } else {
-                deactivate_internal(&mut d);
-            }
-            let _ = app.emit("status_change", d.is_active);
-        }
-    }
-}
-
-fn activate_internal(d: &mut AppData) {
-    if d.is_active {
-        return;
-    }
-    if d.original_ramps.is_empty() {
-        save_original_ramps(&mut d.original_ramps, &d.selected_monitors);
-    }
-    let from = d
-        .original_ramps
-        .values()
-        .next()
-        .copied()
-        .unwrap_or(calculate_ramp(1.0, 0.5, 0.5));
-    d.fade_from = Some(from);
-    d.fade_to = Some(d.cached_ramp);
-    d.fade_step = 0;
-    d.is_fading = true;
-    d.is_active = true;
-}
-
-fn deactivate_internal(d: &mut AppData) {
-    if !d.is_active {
-        return;
-    }
-    let current = if d.is_fading {
-        match (&d.fade_from, &d.fade_to) {
-            (Some(from), Some(to)) => lerp_ramp(from, to, d.fade_step as f32 / FADE_STEPS as f32),
-            _ => d.cached_ramp,
-        }
-    } else {
-        d.cached_ramp
-    };
-
-    if d.original_ramps.is_empty() {
-        save_original_ramps(&mut d.original_ramps, &d.selected_monitors);
-    }
-
-    if let Some(original) = d.original_ramps.values().next().copied() {
-        d.fade_from = Some(current);
-        d.fade_to = Some(original);
-        d.fade_step = 0;
-        d.is_fading = true;
-    } else {
-        restore_originals(&d.selected_monitors, &d.original_ramps);
-    }
-    d.is_active = false;
-}
-
-#[tauri::command]
-fn restore_all(data: State<Mutex<AppData>>) {
-    let mut d = data.lock().unwrap();
-    restore_originals(&d.selected_monitors, &d.original_ramps);
     d.is_active = false;
     d.is_fading = false;
     d.fade_from = None;
     d.fade_to = None;
+    let _ = app.emit("status_change", false);
 }
 
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    let data = handle.state::<Mutex<AppData>>();
-                    tick(data, handle.clone());
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+                if let Ok(mut d) = handle.state::<Mutex<AppData>>().try_lock() {
+                    tick(&mut d, &handle);
                 }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_monitors,
-            get_state,
             apply_settings,
-            set_toggle_key,
-            set_auto_key,
+            start_key_capture,
+            cancel_key_capture,
             set_auto_mode,
             set_target_process,
             toggle,
-            scan_key,
             restore_all,
         ])
         .run(tauri::generate_context!())
