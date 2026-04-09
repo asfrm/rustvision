@@ -9,14 +9,21 @@ use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::psapi::GetProcessImageFileNameW;
 use winapi::um::wingdi::{
     CreateDCW, DeleteDC, GetDeviceGammaRamp, SetDeviceGammaRamp, DISPLAY_DEVICEW,
-    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE,
 };
 use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 use winapi::um::winuser::{
     GetAsyncKeyState, GetForegroundWindow, GetWindowThreadProcessId, EnumDisplayDevicesW,
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFOEXW, MONITOR_DEFAULTTONULL,
 };
 
 type GammaRamp = [u16; 768];
+
+const FADE_STEP: f32 = 0.025;
+
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
 
 #[derive(Clone, Copy, PartialEq)]
 struct DisplaySettings {
@@ -41,11 +48,22 @@ enum KeyTarget {
     Auto,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum MonitorTarget {
+    Primary,
+    All,
+    Active,
+}
+
 struct AppState {
     settings: DisplaySettings,
     is_active: bool,
     original_ramps: HashMap<String, GammaRamp>,
     cached_ramp: GammaRamp,
+    monitor_target: MonitorTarget,
+    fade_from: Option<GammaRamp>,
+    fade_to: Option<GammaRamp>,
+    fade_progress: f32,
     toggle_key: i32,
     auto_key: i32,
     waiting_for_key: Option<KeyTarget>,
@@ -64,6 +82,10 @@ impl Default for AppState {
             is_active: false,
             original_ramps: HashMap::new(),
             cached_ramp: calculate_ramp(&settings),
+            monitor_target: MonitorTarget::Primary,
+            fade_from: None,
+            fade_to: None,
+            fade_progress: 0.0,
             toggle_key: 0x78,
             auto_key: 0x79,
             waiting_for_key: None,
@@ -77,7 +99,7 @@ impl Default for AppState {
 }
 
 fn calculate_ramp(settings: &DisplaySettings) -> GammaRamp {
-    let mut ramp_float = [0.0f32; 256];
+    let mut ramp: GammaRamp = [0; 768];
     let contrast_factor = (settings.contrast + 0.5).powf(2.0);
 
     for i in 0..256 {
@@ -88,40 +110,47 @@ fn calculate_ramp(settings: &DisplaySettings) -> GammaRamp {
             val = val.powf(1.0 / settings.gamma.max(0.01));
         }
 
-        ramp_float[i] = val.clamp(0.0, 1.0);
-    }
-
-    let min_val = ramp_float.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_val = ramp_float.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let spread = max_val - min_val;
-
-    if spread < 0.05 {
-        let center = (max_val + min_val) / 2.0;
-        for i in 0..256 {
-            let t = i as f32 / 255.0;
-            ramp_float[i] = (center - 0.025 + t * 0.05).clamp(0.0, 1.0);
-        }
-    }
-
-    for i in 1..256 {
-        if ramp_float[i] <= ramp_float[i - 1] {
-            let next_val = if i < 255 { ramp_float[i + 1] } else { 1.0 };
-            ramp_float[i] = (ramp_float[i - 1] + next_val) / 2.0;
-        }
-    }
-
-    let mut ramp: GammaRamp = [0; 768];
-    for i in 0..256 {
-        let word = (ramp_float[i] * 65535.0) as u16;
-        ramp[i] = word;
-        ramp[i + 256] = word;
-        ramp[i + 512] = word;
+        let word = val.clamp(0.0, 1.0) * 65535.0;
+        ramp[i] = word as u16;
+        ramp[i + 256] = ramp[i];
+        ramp[i + 512] = ramp[i];
     }
     ramp
 }
 
+fn lerp_ramp(from: &GammaRamp, to: &GammaRamp, t: f32) -> GammaRamp {
+    let mut result: GammaRamp = [0; 768];
+    for i in 0..768 {
+        result[i] = (from[i] as f32 + (to[i] as f32 - from[i] as f32) * t) as u16;
+    }
+    result
+}
+
 impl AppState {
-    fn save_original_ramps(&mut self) {
+    fn get_active_monitor_device(&self) -> String {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return String::new();
+            }
+            let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+            if hmonitor.is_null() {
+                return String::new();
+            }
+            let mut info: MONITORINFOEXW = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _) != 0 {
+                String::from_utf16_lossy(&info.szDevice)
+                    .trim_end_matches('\0')
+                    .to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    fn enumerate_monitors(&self) -> Vec<(String, bool)> {
+        let mut monitors = Vec::new();
         unsafe {
             let mut device: DISPLAY_DEVICEW = std::mem::zeroed();
             device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
@@ -129,83 +158,95 @@ impl AppState {
 
             while EnumDisplayDevicesW(null_mut(), dev_num, &mut device, 0) != 0 {
                 if (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 {
-                    let hdc = CreateDCW(
-                        null_mut(),
-                        device.DeviceName.as_ptr(),
-                        null_mut(),
-                        null_mut(),
-                    );
-                    if !hdc.is_null() {
-                        let device_name = String::from_utf16_lossy(&device.DeviceName)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        if !self.original_ramps.contains_key(&device_name) {
-                            let mut current: GammaRamp = [0; 768];
-                            if GetDeviceGammaRamp(hdc, current.as_mut_ptr() as *mut _) != 0 {
-                                self.original_ramps.insert(device_name, current);
-                            }
-                        }
-                        DeleteDC(hdc);
-                    }
+                    let name = String::from_utf16_lossy(&device.DeviceName)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    let is_primary = (device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+                    monitors.push((name, is_primary));
                 }
                 dev_num += 1;
+            }
+        }
+        monitors
+    }
+
+    fn should_apply_to_device(&self, device_name: &str, is_primary: bool) -> bool {
+        match self.monitor_target {
+            MonitorTarget::Primary => is_primary,
+            MonitorTarget::All => true,
+            MonitorTarget::Active => {
+                let active = self.get_active_monitor_device();
+                !active.is_empty() && device_name == active
+            }
+        }
+    }
+
+    fn save_original_ramps(&mut self) {
+        for (name, _) in self.enumerate_monitors() {
+            if self.original_ramps.contains_key(&name) {
+                continue;
+            }
+            unsafe {
+                let wide = to_wide(&name);
+                let hdc = CreateDCW(null_mut(), wide.as_ptr(), null_mut(), null_mut());
+                if !hdc.is_null() {
+                    let mut current: GammaRamp = [0; 768];
+                    if GetDeviceGammaRamp(hdc, current.as_mut_ptr() as *mut _) != 0 {
+                        self.original_ramps.insert(name, current);
+                    }
+                    DeleteDC(hdc);
+                }
+            }
+        }
+    }
+
+    fn apply_ramp_to_device(&self, ramp: &GammaRamp, device_name: &str) {
+        unsafe {
+            let wide = to_wide(device_name);
+            let hdc = CreateDCW(null_mut(), wide.as_ptr(), null_mut(), null_mut());
+            if !hdc.is_null() {
+                SetDeviceGammaRamp(hdc, ramp.as_ptr() as *mut _);
+                DeleteDC(hdc);
             }
         }
     }
 
     fn apply_ramp(&self, ramp: &GammaRamp) {
-        unsafe {
-            let mut device: DISPLAY_DEVICEW = std::mem::zeroed();
-            device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-            let mut dev_num = 0;
-
-            while EnumDisplayDevicesW(null_mut(), dev_num, &mut device, 0) != 0 {
-                if (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 {
-                    let hdc = CreateDCW(
-                        null_mut(),
-                        device.DeviceName.as_ptr(),
-                        null_mut(),
-                        null_mut(),
-                    );
-                    if !hdc.is_null() {
-                        SetDeviceGammaRamp(hdc, ramp.as_ptr() as *mut _);
-                        DeleteDC(hdc);
-                    }
-                }
-                dev_num += 1;
+        for (name, is_primary) in self.enumerate_monitors() {
+            if self.should_apply_to_device(&name, is_primary) {
+                self.apply_ramp_to_device(ramp, &name);
             }
         }
     }
 
     fn restore_original_ramps(&self) {
-        if self.original_ramps.is_empty() {
-            return;
-        }
-        unsafe {
-            let mut device: DISPLAY_DEVICEW = std::mem::zeroed();
-            device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-            let mut dev_num = 0;
-
-            while EnumDisplayDevicesW(null_mut(), dev_num, &mut device, 0) != 0 {
-                if (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 {
-                    let hdc = CreateDCW(
-                        null_mut(),
-                        device.DeviceName.as_ptr(),
-                        null_mut(),
-                        null_mut(),
-                    );
-                    if !hdc.is_null() {
-                        let device_name = String::from_utf16_lossy(&device.DeviceName)
-                            .trim_end_matches('\0')
-                            .to_string();
-                        if let Some(original) = self.original_ramps.get(&device_name) {
-                            SetDeviceGammaRamp(hdc, original.as_ptr() as *mut _);
-                        }
-                        DeleteDC(hdc);
-                    }
+        for (name, is_primary) in self.enumerate_monitors() {
+            if self.should_apply_to_device(&name, is_primary) {
+                if let Some(original) = self.original_ramps.get(&name) {
+                    self.apply_ramp_to_device(original, &name);
                 }
-                dev_num += 1;
             }
+        }
+    }
+
+    fn start_fade(&mut self, from: GammaRamp, to: GammaRamp) {
+        self.fade_from = Some(from);
+        self.fade_to = Some(to);
+        self.fade_progress = 0.0;
+    }
+
+    fn tick_fade(&mut self) {
+        if let (Some(from), Some(to)) = (&self.fade_from, &self.fade_to) {
+            if self.fade_progress >= 1.0 {
+                self.apply_ramp(to);
+                self.fade_from = None;
+                self.fade_to = None;
+                self.fade_progress = 0.0;
+                return;
+            }
+            let ramp = lerp_ramp(from, to, self.fade_progress);
+            self.apply_ramp(&ramp);
+            self.fade_progress += FADE_STEP;
         }
     }
 
@@ -213,10 +254,13 @@ impl AppState {
         if self.is_active {
             return;
         }
-        if self.original_ramps.is_empty() {
-            self.save_original_ramps();
-        }
-        self.apply_ramp(&self.cached_ramp);
+        self.save_original_ramps();
+
+        let from = self.original_ramps.values().next().copied().unwrap_or_else(|| {
+            calculate_ramp(&DisplaySettings::default())
+        });
+
+        self.start_fade(from, self.cached_ramp);
         self.is_active = true;
     }
 
@@ -224,14 +268,34 @@ impl AppState {
         if !self.is_active {
             return;
         }
-        self.restore_original_ramps();
+
+        let current = match (&self.fade_from, &self.fade_to) {
+            (Some(from), Some(to)) => {
+                lerp_ramp(from, to, self.fade_progress.min(1.0))
+            }
+            _ => self.cached_ramp,
+        };
+
+        self.save_original_ramps();
+
+        if let Some(original) = self.original_ramps.values().next().copied() {
+            self.start_fade(current, original);
+        } else {
+            self.restore_original_ramps();
+        }
         self.is_active = false;
     }
 
     fn refresh_ramp(&mut self) {
         self.cached_ramp = calculate_ramp(&self.settings);
         if self.is_active {
-            self.apply_ramp(&self.cached_ramp);
+            let current = match (&self.fade_from, &self.fade_to) {
+                (Some(from), Some(to)) => {
+                    lerp_ramp(from, to, self.fade_progress.min(1.0))
+                }
+                _ => self.cached_ramp,
+            };
+            self.start_fade(current, self.cached_ramp);
         }
     }
 
@@ -345,6 +409,8 @@ impl eframe::App for AppState {
             self.last_check = now;
         }
 
+        self.tick_fade();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("RustVision");
@@ -372,8 +438,19 @@ impl eframe::App for AppState {
 
             ui.add_space(10.0);
 
+            ui.group(|ui| {
+                ui.label("Монитор:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.monitor_target, MonitorTarget::Primary, "Основной");
+                    ui.radio_value(&mut self.monitor_target, MonitorTarget::All, "Все");
+                    ui.radio_value(&mut self.monitor_target, MonitorTarget::Active, "Активный");
+                });
+            });
+
+            ui.add_space(10.0);
+
             let gamma_slider =
-                ui.add(egui::Slider::new(&mut self.settings.gamma, 0.5..=3.0).text("Гамма"));
+                ui.add(egui::Slider::new(&mut self.settings.gamma, 0.1..=10.0).text("Гамма"));
             let brightness_slider =
                 ui.add(egui::Slider::new(&mut self.settings.brightness, 0.0..=1.0).text("Яркость"));
             let contrast_slider =
@@ -419,7 +496,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([340.0, 420.0])
+            .with_inner_size([370.0, 480.0])
             .with_resizable(false)
             .with_icon(icon_data),
         ..Default::default()
