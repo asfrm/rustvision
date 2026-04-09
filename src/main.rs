@@ -77,9 +77,8 @@ impl Default for AppState {
 }
 
 fn calculate_ramp(settings: &DisplaySettings) -> GammaRamp {
-    let mut ramp = [0u16; 768];
+    let mut ramp_float = [0.0f32; 256];
     let contrast_factor = (settings.contrast + 0.5).powf(2.0);
-    let mut last_val: u16 = 0;
 
     for i in 0..256 {
         let mut val = (i as f32 / 255.0 - 0.5) * contrast_factor + 0.5;
@@ -89,13 +88,31 @@ fn calculate_ramp(settings: &DisplaySettings) -> GammaRamp {
             val = val.powf(1.0 / settings.gamma.max(0.01));
         }
 
-        let mut word = (val.clamp(0.0, 1.0) * 65535.0) as u16;
+        ramp_float[i] = val.clamp(0.0, 1.0);
+    }
 
-        if i > 0 && word <= last_val && last_val < 65535 {
-            word = last_val + 1;
+    let min_val = ramp_float.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = ramp_float.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let spread = max_val - min_val;
+
+    if spread < 0.05 {
+        let center = (max_val + min_val) / 2.0;
+        for i in 0..256 {
+            let t = i as f32 / 255.0;
+            ramp_float[i] = (center - 0.025 + t * 0.05).clamp(0.0, 1.0);
         }
-        last_val = word;
+    }
 
+    for i in 1..256 {
+        if ramp_float[i] <= ramp_float[i - 1] {
+            let next_val = if i < 255 { ramp_float[i + 1] } else { 1.0 };
+            ramp_float[i] = (ramp_float[i - 1] + next_val) / 2.0;
+        }
+    }
+
+    let mut ramp: GammaRamp = [0; 768];
+    for i in 0..256 {
+        let word = (ramp_float[i] * 65535.0) as u16;
         ramp[i] = word;
         ramp[i + 256] = word;
         ramp[i + 512] = word;
