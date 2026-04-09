@@ -11,8 +11,8 @@
     <header>
       <h1>RustVision</h1>
       <div class="lang-switch">
-        <button id="lang-en" class="lang-btn active" onclick="setLang('en')">EN</button>
-        <button id="lang-ru" class="lang-btn" onclick="setLang('ru')">RU</button>
+        <button id="lang-en" class="lang-btn active">EN</button>
+        <button id="lang-ru" class="lang-btn">RU</button>
       </div>
     </header>
 
@@ -23,7 +23,7 @@
       </label>
       <div class="row">
         <span data-i18n="bind">Bind:</span>
-        <button id="auto-bind-btn" class="btn bind-btn" onclick="waitingForAutoKey()">F9</button>
+        <button id="auto-bind-btn" class="btn bind-btn">F9</button>
       </div>
       <div class="row">
         <span data-i18n="process">Process:</span>
@@ -34,7 +34,7 @@
     <div class="section">
       <div class="row">
         <span data-i18n="toggleBind">Toggle bind:</span>
-        <button id="toggle-bind-btn" class="btn bind-btn" onclick="waitingForToggleKey()">F8</button>
+        <button id="toggle-bind-btn" class="btn bind-btn">F8</button>
       </div>
     </div>
 
@@ -46,18 +46,27 @@
     <div class="section sliders">
       <div class="slider-row">
         <label data-i18n="gamma">Gamma</label>
-        <input type="range" id="gamma" min="0.1" max="10.0" step="0.1" value="1.0">
-        <span id="gamma-val" class="slider-val">1.0</span>
+        <div class="slider-wrap">
+          <input type="range" id="gamma" min="0.1" max="10.0" step="0.01" value="1.0">
+          <div class="slider-center-mark" style="left: calc((1.0 - 0.1) / (10.0 - 0.1) * 100%)"></div>
+        </div>
+        <span id="gamma-val" class="slider-val">1.00</span>
       </div>
       <div class="slider-row">
         <label data-i18n="brightness">Brightness</label>
-        <input type="range" id="brightness" min="0.0" max="1.0" step="0.01" value="0.5">
-        <span id="brightness-val" class="slider-val">0.5</span>
+        <div class="slider-wrap">
+          <input type="range" id="brightness" min="0.0" max="1.0" step="0.01" value="0.5">
+          <div class="slider-center-mark" style="left: 50%"></div>
+        </div>
+        <span id="brightness-val" class="slider-val">0.50</span>
       </div>
       <div class="slider-row">
         <label data-i18n="contrast">Contrast</label>
-        <input type="range" id="contrast" min="0.0" max="1.0" step="0.01" value="0.5">
-        <span id="contrast-val" class="slider-val">0.5</span>
+        <div class="slider-wrap">
+          <input type="range" id="contrast" min="0.0" max="1.0" step="0.01" value="0.5">
+          <div class="slider-center-mark" style="left: 50%"></div>
+        </div>
+        <span id="contrast-val" class="slider-val">0.50</span>
       </div>
     </div>
 
@@ -71,17 +80,18 @@
   </div>
 
   <script>
-    const { invoke } = window.__TAURI__.core;
+    const { invoke, listen } = window.__TAURI__.core;
+
+    const SNAP_DIST = 0.04;
 
     let lang = 'en';
     let waitingForKey = null;
-    let settings = {
+    let keyScanInterval = null;
+
+    const defaults = {
       gamma: 1.0,
       brightness: 0.5,
       contrast: 0.5,
-      selectedMonitors: [],
-      autoMode: false,
-      targetProcess: 'RustClient.exe',
     };
 
     const i18n = {
@@ -98,6 +108,7 @@
         waiting: 'Waiting..',
         active: 'Active..',
         listening: '...',
+        keyLabel: key => formatKey(key),
       },
       ru: {
         autoMode: 'Авто-режим',
@@ -112,8 +123,18 @@
         waiting: 'Жду..',
         active: 'Работаю..',
         listening: '...',
+        keyLabel: key => formatKey(key),
       },
     };
+
+    function formatKey(code) {
+      if (code >= 0x70 && code <= 0x87) return 'F' + (code - 0x6F);
+      if (code === 0x08) return 'BACK';
+      if (code === 0x20) return 'SPACE';
+      if (code >= 0x30 && code <= 0x39) return String.fromCharCode(code);
+      if (code >= 0x41 && code <= 0x5A) return String.fromCharCode(code);
+      return '0x' + code.toString(16).toUpperCase();
+    }
 
     function setLang(l) {
       lang = l;
@@ -123,141 +144,203 @@
         const key = el.getAttribute('data-i18n');
         if (i18n[l][key]) el.textContent = i18n[l][key];
       });
-      updateStatus();
-    }
-
-    function updateStatus() {
-      const status = document.getElementById('status');
-      const isActive = status.classList.contains('status-active');
-      const key = isActive ? 'active' : 'waiting';
-      status.querySelector('span:last-child').textContent = i18n[lang][key];
     }
 
     function setStatus(active) {
-      const status = document.getElementById('status');
-      status.classList.toggle('status-active', active);
-      status.classList.toggle('status-inactive', !active);
-      updateStatus();
+      const el = document.getElementById('status');
+      el.classList.toggle('status-active', active);
+      el.classList.toggle('status-inactive', !active);
+      const key = active ? 'active' : 'waiting';
+      el.querySelector('span:last-child').textContent = i18n[lang][key];
     }
 
-    function waitingForToggleKey() {
-      const btn = document.getElementById('toggle-bind-btn');
+    function startKeyBinding(btnId) {
+      waitingForKey = btnId;
+      const btn = document.getElementById(btnId);
       btn.textContent = i18n[lang].listening;
-      waitingForKey = 'toggle';
+      btn.classList.add('listening');
+
+      keyScanInterval = setInterval(async () => {
+        const code = await invoke('scan_key');
+        if (code !== null) {
+          const label = formatKey(code);
+          btn.textContent = label;
+          btn.classList.remove('listening');
+
+          if (btnId === 'toggle-bind-btn') {
+            await invoke('set_toggle_key', { key: code });
+          } else {
+            await invoke('set_auto_key', { key: code });
+          }
+          clearInterval(keyScanInterval);
+          keyScanInterval = null;
+          waitingForKey = null;
+        }
+      }, 50);
     }
 
-    function waitingForAutoKey() {
-      const btn = document.getElementById('auto-bind-btn');
-      btn.textContent = i18n[lang].listening;
-      waitingForKey = 'auto';
-    }
+    document.getElementById('toggle-bind-btn').addEventListener('click', () => {
+      if (!waitingForKey) startKeyBinding('toggle-bind-btn');
+    });
+
+    document.getElementById('auto-bind-btn').addEventListener('click', () => {
+      if (!waitingForKey) startKeyBinding('auto-bind-btn');
+    });
+
+    document.getElementById('lang-en').addEventListener('click', () => setLang('en'));
+    document.getElementById('lang-ru').addEventListener('click', () => setLang('ru'));
 
     async function loadMonitors() {
       const monitors = await invoke('get_monitors');
       const list = document.getElementById('monitor-list');
       list.innerHTML = '';
-      settings.selectedMonitors = monitors.filter(m => m.is_primary).map(m => m.name);
+      if (monitors.length === 0) return;
 
       monitors.forEach(m => {
         const item = document.createElement('label');
         item.className = 'monitor-item';
-        const checked = settings.selectedMonitors.includes(m.name) ? 'checked' : '';
+        const checked = m.is_primary ? 'checked' : '';
         item.innerHTML = `
           <input type="checkbox" value="${m.name}" ${checked} onchange="updateMonitorSelection()">
           <span>${m.label}</span>
         `;
         list.appendChild(item);
       });
+      updateMonitorSelection();
     }
 
     function updateMonitorSelection() {
-      settings.selectedMonitors = [];
+      const selected = [];
       document.querySelectorAll('#monitor-list input[type="checkbox"]').forEach(cb => {
-        if (cb.checked) settings.selectedMonitors.push(cb.value);
+        if (cb.checked) selected.push(cb.value);
       });
-    }
-
-    async function sendSettings() {
-      await invoke('apply_settings', { settings });
-    }
-
-    async function onToggle() {
-      const active = await invoke('toggle');
-      setStatus(active);
-    }
-
-    const gamma = document.getElementById('gamma');
-    const brightness = document.getElementById('brightness');
-    const contrast = document.getElementById('contrast');
-
-    function onSliderChange() {
-      settings.gamma = parseFloat(gamma.value);
-      settings.brightness = parseFloat(brightness.value);
-      settings.contrast = parseFloat(contrast.value);
-
-      document.getElementById('gamma-val').textContent = settings.gamma.toFixed(1);
-      document.getElementById('brightness-val').textContent = settings.brightness.toFixed(2);
-      document.getElementById('contrast-val').textContent = settings.contrast.toFixed(2);
-
       sendSettings();
     }
 
-    gamma.addEventListener('input', onSliderChange);
-    brightness.addEventListener('input', onSliderChange);
-    contrast.addEventListener('input', onSliderChange);
+    function getSelectedMonitors() {
+      const selected = [];
+      document.querySelectorAll('#monitor-list input[type="checkbox"]').forEach(cb => {
+        if (cb.checked) selected.push(cb.value);
+      });
+      return selected;
+    }
+
+    async function sendSettings() {
+      const gamma = parseFloat(document.getElementById('gamma').value);
+      const brightness = parseFloat(document.getElementById('brightness').value);
+      const contrast = parseFloat(document.getElementById('contrast').value);
+      await invoke('apply_settings', {
+        settings: {
+          gamma,
+          brightness,
+          contrast,
+          selected_monitors: getSelectedMonitors(),
+        },
+      });
+    }
+
+    function magnetValue(raw, center) {
+      const diff = Math.abs(raw - center);
+      if (diff < SNAP_DIST) return center;
+      return raw;
+    }
+
+    const gammaSlider = document.getElementById('gamma');
+    const brightnessSlider = document.getElementById('brightness');
+    const contrastSlider = document.getElementById('contrast');
+
+    let sliderDragging = null;
+    let sliderStartValues = {};
+
+    [gammaSlider, brightnessSlider, contrastSlider].forEach(slider => {
+      slider.addEventListener('mousedown', (e) => {
+        sliderDragging = e.target.id;
+        sliderStartValues = {
+          gamma: parseFloat(gammaSlider.value),
+          brightness: parseFloat(brightnessSlider.value),
+          contrast: parseFloat(contrastSlider.value),
+        };
+      });
+
+      slider.addEventListener('input', () => {
+        const g = parseFloat(gammaSlider.value);
+        const b = parseFloat(brightnessSlider.value);
+        const c = parseFloat(contrastSlider.value);
+
+        document.getElementById('gamma-val').textContent = g.toFixed(2);
+        document.getElementById('brightness-val').textContent = b.toFixed(2);
+        document.getElementById('contrast-val').textContent = c.toFixed(2);
+      });
+
+      slider.addEventListener('mouseup', () => {
+        if (sliderDragging === slider.id) {
+          let raw = parseFloat(slider.value);
+          let center, min, max;
+          if (slider.id === 'gamma') {
+            center = defaults.gamma; min = 0.1; max = 10.0;
+          } else {
+            center = 0.5; min = 0.0; max = 1.0;
+          }
+          const magnetized = magnetValue(raw, center);
+          slider.value = magnetized;
+
+          document.getElementById(slider.id + '-val').textContent = magnetized.toFixed(2);
+          sliderDragging = null;
+          sendSettings();
+        }
+      });
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (sliderDragging) {
+        const slider = document.getElementById(sliderDragging);
+        let raw = parseFloat(slider.value);
+        let center;
+        if (sliderDragging === 'gamma') {
+          center = defaults.gamma;
+        } else {
+          center = 0.5;
+        }
+        const magnetized = magnetValue(raw, center);
+        slider.value = magnetized;
+        document.getElementById(sliderDragging + '-val').textContent = magnetized.toFixed(2);
+        sliderDragging = null;
+        sendSettings();
+      }
+    });
 
     document.getElementById('auto-mode').addEventListener('change', (e) => {
-      settings.autoMode = e.target.checked;
-      settings.targetProcess = document.getElementById('target-process').value;
-      if (!e.target.checked) {
-        invoke('set_active', { active: false, settings });
-        setStatus(false);
-      }
+      invoke('set_auto_mode', { enabled: e.target.checked });
     });
 
     document.getElementById('target-process').addEventListener('change', (e) => {
-      settings.targetProcess = e.target.value;
+      invoke('set_target_process', { target: e.target.value });
     });
 
     document.getElementById('reset-btn').addEventListener('click', () => {
-      gamma.value = 1.0;
-      brightness.value = 0.5;
-      contrast.value = 0.5;
-      onSliderChange();
+      gammaSlider.value = defaults.gamma;
+      brightnessSlider.value = defaults.brightness;
+      contrastSlider.value = defaults.contrast;
+      document.getElementById('gamma-val').textContent = defaults.gamma.toFixed(2);
+      document.getElementById('brightness-val').textContent = defaults.brightness.toFixed(2);
+      document.getElementById('contrast-val').textContent = defaults.contrast.toFixed(2);
+      sendSettings();
+      invoke('restore_all');
+      setStatus(false);
     });
-
-    async function tick() {
-      if (waitingForKey) {
-        const result = await invoke('check_hotkeys');
-        if (result !== null) {
-          setStatus(result);
-        }
-        if (waitingForKey === 'toggle') {
-          for (let i = 8; i < 255; i++) {
-            if (await invoke('check_hotkeys')) break;
-          }
-        }
-        waitingForKey = null;
-        document.getElementById('toggle-bind-btn').textContent = 'F8';
-        document.getElementById('auto-bind-btn').textContent = 'F9';
-      }
-
-      if (settings.autoMode) {
-        const target = settings.targetProcess;
-        const isTarget = await invoke('check_auto_mode', { target });
-        if (isTarget !== null) {
-          await invoke('set_active', { active: isTarget, settings });
-          setStatus(isTarget);
-        }
-      }
-
-      await invoke('tick_fade');
-    }
 
     async function init() {
       await loadMonitors();
-      onSliderChange();
-      setInterval(tick, 100);
+
+      const state = await invoke('get_state');
+      document.getElementById('toggle-bind-btn').textContent = formatKey(state.toggle_key);
+      document.getElementById('auto-bind-btn').textContent = formatKey(state.auto_key);
+      setStatus(state.is_active);
+
+      listen('status_change', (e) => setStatus(e.payload));
+      listen('auto_mode_change', (e) => {
+        document.getElementById('auto-mode').checked = e.payload;
+      });
     }
 
     init();
