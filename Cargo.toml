@@ -1,3 +1,25 @@
-[workspace]
-members = ["src-tauri"]
-resolver = "2"
+[package]
+name = "rustvision"
+version = "1.0.0"
+description = "Gamma/brightness/contrast utility for Windows"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+eframe = "0.24.0"
+image = { version = "0.24", default-features = false, features = ["ico", "png"] }
+
+winapi = { version = "0.3.9", features = [
+    "wingdi",
+    "winuser",
+    "minwindef",
+    "windef",
+    "psapi",
+    "processthreadsapi",
+    "handleapi",
+    "winnt",
+    "shellapi"
+] }
+
+[build-dependencies]
+winres = "0.1"
