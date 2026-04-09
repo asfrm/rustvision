@@ -36,6 +36,20 @@ struct DisplaySettings {
     contrast_pct: f32,
 }
 
+impl DisplaySettings {
+    fn gamma_from_adj(adj: f32) -> f32 {
+        (1.0 + adj).max(0.01)
+    }
+
+    fn brightness_from_adj(adj: f32) -> f32 {
+        100.0 + adj
+    }
+
+    fn contrast_from_adj(adj: f32) -> f32 {
+        100.0 + adj
+    }
+}
+
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
@@ -114,9 +128,6 @@ struct AppState {
     target_process: String,
     last_check: f64,
     lang: Lang,
-    was_dragging_gamma: bool,
-    was_dragging_brightness: bool,
-    was_dragging_contrast: bool,
 }
 
 impl Default for AppState {
@@ -142,9 +153,6 @@ impl Default for AppState {
             target_process: "RustClient.exe".to_string(),
             last_check: 0.0,
             lang: Lang::En,
-            was_dragging_gamma: false,
-            was_dragging_brightness: false,
-            was_dragging_contrast: false,
         };
         me.enumerate_monitors();
         me
@@ -546,49 +554,41 @@ impl eframe::App for AppState {
 
             ui.add_space(6.0);
 
-            const GAMMA_MAGNET: f32 = 0.05;
-            const PCT_MAGNET: f32 = 2.0;
-
+            let mut gamma_adj = self.settings.gamma - 1.0;
+            let gamma_val = DisplaySettings::gamma_from_adj(gamma_adj);
+            let gamma_label = format!("{}: {:.1}", I18n::tr(&self.lang, "gamma"), gamma_val);
             let gamma_resp = ui.add(
-                egui::Slider::new(&mut self.settings.gamma, 0.1..=10.0)
-                    .text(I18n::tr(&self.lang, "gamma"))
-                    .fixed_decimals(2)
+                egui::Slider::new(&mut gamma_adj, -2.5..=2.5)
+                    .text(&gamma_label)
+                    .step_by(0.1)
             );
-            let gamma_dragging = gamma_resp.dragged();
-            if !gamma_dragging && self.was_dragging_gamma {
-                if (self.settings.gamma - 1.0).abs() < GAMMA_MAGNET {
-                    self.settings.gamma = 1.0;
-                }
+            if gamma_resp.changed() {
+                self.settings.gamma = DisplaySettings::gamma_from_adj(gamma_adj);
             }
-            self.was_dragging_gamma = gamma_dragging;
 
+            let mut brightness_adj = self.settings.brightness_pct - 100.0;
+            let brightness_val = DisplaySettings::brightness_from_adj(brightness_adj);
+            let brightness_label = format!("{}: {}%", I18n::tr(&self.lang, "brightness"), brightness_val.round() as i32);
             let brightness_resp = ui.add(
-                egui::Slider::new(&mut self.settings.brightness_pct, 0.0..=200.0)
-                    .text(format!("{} (%)", I18n::tr(&self.lang, "brightness")))
-                    .suffix("%")
-                    .fixed_decimals(0)
+                egui::Slider::new(&mut brightness_adj, -50.0..=50.0)
+                    .text(&brightness_label)
+                    .step_by(1.0)
             );
-            let brightness_dragging = brightness_resp.dragged();
-            if !brightness_dragging && self.was_dragging_brightness {
-                if (self.settings.brightness_pct - 100.0).abs() < PCT_MAGNET {
-                    self.settings.brightness_pct = 100.0;
-                }
+            if brightness_resp.changed() {
+                self.settings.brightness_pct = DisplaySettings::brightness_from_adj(brightness_adj);
             }
-            self.was_dragging_brightness = brightness_dragging;
 
+            let mut contrast_adj = self.settings.contrast_pct - 100.0;
+            let contrast_val = DisplaySettings::contrast_from_adj(contrast_adj);
+            let contrast_label = format!("{}: {}%", I18n::tr(&self.lang, "contrast"), contrast_val.round() as i32);
             let contrast_resp = ui.add(
-                egui::Slider::new(&mut self.settings.contrast_pct, 0.0..=200.0)
-                    .text(format!("{} (%)", I18n::tr(&self.lang, "contrast")))
-                    .suffix("%")
-                    .fixed_decimals(0)
+                egui::Slider::new(&mut contrast_adj, -50.0..=50.0)
+                    .text(&contrast_label)
+                    .step_by(1.0)
             );
-            let contrast_dragging = contrast_resp.dragged();
-            if !contrast_dragging && self.was_dragging_contrast {
-                if (self.settings.contrast_pct - 100.0).abs() < PCT_MAGNET {
-                    self.settings.contrast_pct = 100.0;
-                }
+            if contrast_resp.changed() {
+                self.settings.contrast_pct = DisplaySettings::contrast_from_adj(contrast_adj);
             }
-            self.was_dragging_contrast = contrast_dragging;
 
             if gamma_resp.changed() || brightness_resp.changed() || contrast_resp.changed() {
                 self.refresh_ramp();
