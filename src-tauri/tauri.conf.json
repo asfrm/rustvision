@@ -1,0 +1,32 @@
+{
+  "productName": "RustVision",
+  "version": "1.0.0",
+  "identifier": "com.rustvision.app",
+  "build": {
+    "frontendDist": "../src",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "RustVision",
+        "width": 420,
+        "height": 560,
+        "resizable": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "../icon.ico"
+    ]
+  }
+}

@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RustVision</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>RustVision</h1>
+      <div class="lang-switch">
+        <button id="lang-en" class="lang-btn active" onclick="setLang('en')">EN</button>
+        <button id="lang-ru" class="lang-btn" onclick="setLang('ru')">RU</button>
+      </div>
+    </header>
+
+    <div class="section">
+      <label class="checkbox-label">
+        <input type="checkbox" id="auto-mode">
+        <span data-i18n="autoMode">Auto mode</span>
+      </label>
+      <div class="row">
+        <span data-i18n="bind">Bind:</span>
+        <button id="auto-bind-btn" class="btn bind-btn" onclick="waitingForAutoKey()">F9</button>
+      </div>
+      <div class="row">
+        <span data-i18n="process">Process:</span>
+        <input type="text" id="target-process" value="RustClient.exe" class="input">
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="row">
+        <span data-i18n="toggleBind">Toggle bind:</span>
+        <button id="toggle-bind-btn" class="btn bind-btn" onclick="waitingForToggleKey()">F8</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <label data-i18n="monitors">Monitors:</label>
+      <div id="monitor-list" class="monitor-list"></div>
+    </div>
+
+    <div class="section sliders">
+      <div class="slider-row">
+        <label data-i18n="gamma">Gamma</label>
+        <input type="range" id="gamma" min="0.1" max="10.0" step="0.1" value="1.0">
+        <span id="gamma-val" class="slider-val">1.0</span>
+      </div>
+      <div class="slider-row">
+        <label data-i18n="brightness">Brightness</label>
+        <input type="range" id="brightness" min="0.0" max="1.0" step="0.01" value="0.5">
+        <span id="brightness-val" class="slider-val">0.5</span>
+      </div>
+      <div class="slider-row">
+        <label data-i18n="contrast">Contrast</label>
+        <input type="range" id="contrast" min="0.0" max="1.0" step="0.01" value="0.5">
+        <span id="contrast-val" class="slider-val">0.5</span>
+      </div>
+    </div>
+
+    <div class="footer">
+      <button id="reset-btn" class="btn" data-i18n="reset">Reset</button>
+      <div id="status" class="status-inactive">
+        <span class="status-dot"></span>
+        <span data-i18n="waiting">Waiting..</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+
+    let lang = 'en';
+    let waitingForKey = null;
+    let settings = {
+      gamma: 1.0,
+      brightness: 0.5,
+      contrast: 0.5,
+      selectedMonitors: [],
+      autoMode: false,
+      targetProcess: 'RustClient.exe',
+    };
+
+    const i18n = {
+      en: {
+        autoMode: 'Auto mode',
+        bind: 'Bind:',
+        process: 'Process:',
+        toggleBind: 'Toggle bind:',
+        monitors: 'Monitors:',
+        gamma: 'Gamma',
+        brightness: 'Brightness',
+        contrast: 'Contrast',
+        reset: 'Reset',
+        waiting: 'Waiting..',
+        active: 'Active..',
+        listening: '...',
+      },
+      ru: {
+        autoMode: 'Авто-режим',
+        bind: 'Бинд:',
+        process: 'Процесс:',
+        toggleBind: 'Бинд вкл/выкл:',
+        monitors: 'Мониторы:',
+        gamma: 'Гамма',
+        brightness: 'Яркость',
+        contrast: 'Контрастность',
+        reset: 'Сброс',
+        waiting: 'Жду..',
+        active: 'Работаю..',
+        listening: '...',
+      },
+    };
+
+    function setLang(l) {
+      lang = l;
+      document.getElementById('lang-en').classList.toggle('active', l === 'en');
+      document.getElementById('lang-ru').classList.toggle('active', l === 'ru');
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (i18n[l][key]) el.textContent = i18n[l][key];
+      });
+      updateStatus();
+    }
+
+    function updateStatus() {
+      const status = document.getElementById('status');
+      const isActive = status.classList.contains('status-active');
+      const key = isActive ? 'active' : 'waiting';
+      status.querySelector('span:last-child').textContent = i18n[lang][key];
+    }
+
+    function setStatus(active) {
+      const status = document.getElementById('status');
+      status.classList.toggle('status-active', active);
+      status.classList.toggle('status-inactive', !active);
+      updateStatus();
+    }
+
+    function waitingForToggleKey() {
+      const btn = document.getElementById('toggle-bind-btn');
+      btn.textContent = i18n[lang].listening;
+      waitingForKey = 'toggle';
+    }
+
+    function waitingForAutoKey() {
+      const btn = document.getElementById('auto-bind-btn');
+      btn.textContent = i18n[lang].listening;
+      waitingForKey = 'auto';
+    }
+
+    async function loadMonitors() {
+      const monitors = await invoke('get_monitors');
+      const list = document.getElementById('monitor-list');
+      list.innerHTML = '';
+      settings.selectedMonitors = monitors.filter(m => m.is_primary).map(m => m.name);
+
+      monitors.forEach(m => {
+        const item = document.createElement('label');
+        item.className = 'monitor-item';
+        const checked = settings.selectedMonitors.includes(m.name) ? 'checked' : '';
+        item.innerHTML = `
+          <input type="checkbox" value="${m.name}" ${checked} onchange="updateMonitorSelection()">
+          <span>${m.label}</span>
+        `;
+        list.appendChild(item);
+      });
+    }
+
+    function updateMonitorSelection() {
+      settings.selectedMonitors = [];
+      document.querySelectorAll('#monitor-list input[type="checkbox"]').forEach(cb => {
+        if (cb.checked) settings.selectedMonitors.push(cb.value);
+      });
+    }
+
+    async function sendSettings() {
+      await invoke('apply_settings', { settings });
+    }
+
+    async function onToggle() {
+      const active = await invoke('toggle');
+      setStatus(active);
+    }
+
+    const gamma = document.getElementById('gamma');
+    const brightness = document.getElementById('brightness');
+    const contrast = document.getElementById('contrast');
+
+    function onSliderChange() {
+      settings.gamma = parseFloat(gamma.value);
+      settings.brightness = parseFloat(brightness.value);
+      settings.contrast = parseFloat(contrast.value);
+
+      document.getElementById('gamma-val').textContent = settings.gamma.toFixed(1);
+      document.getElementById('brightness-val').textContent = settings.brightness.toFixed(2);
+      document.getElementById('contrast-val').textContent = settings.contrast.toFixed(2);
+
+      sendSettings();
+    }
+
+    gamma.addEventListener('input', onSliderChange);
+    brightness.addEventListener('input', onSliderChange);
+    contrast.addEventListener('input', onSliderChange);
+
+    document.getElementById('auto-mode').addEventListener('change', (e) => {
+      settings.autoMode = e.target.checked;
+      settings.targetProcess = document.getElementById('target-process').value;
+      if (!e.target.checked) {
+        invoke('set_active', { active: false, settings });
+        setStatus(false);
+      }
+    });
+
+    document.getElementById('target-process').addEventListener('change', (e) => {
+      settings.targetProcess = e.target.value;
+    });
+
+    document.getElementById('reset-btn').addEventListener('click', () => {
+      gamma.value = 1.0;
+      brightness.value = 0.5;
+      contrast.value = 0.5;
+      onSliderChange();
+    });
+
+    async function tick() {
+      if (waitingForKey) {
+        const result = await invoke('check_hotkeys');
+        if (result !== null) {
+          setStatus(result);
+        }
+        if (waitingForKey === 'toggle') {
+          for (let i = 8; i < 255; i++) {
+            if (await invoke('check_hotkeys')) break;
+          }
+        }
+        waitingForKey = null;
+        document.getElementById('toggle-bind-btn').textContent = 'F8';
+        document.getElementById('auto-bind-btn').textContent = 'F9';
+      }
+
+      if (settings.autoMode) {
+        const target = settings.targetProcess;
+        const isTarget = await invoke('check_auto_mode', { target });
+        if (isTarget !== null) {
+          await invoke('set_active', { active: isTarget, settings });
+          setStatus(isTarget);
+        }
+      }
+
+      await invoke('tick_fade');
+    }
+
+    async function init() {
+      await loadMonitors();
+      onSliderChange();
+      setInterval(tick, 100);
+    }
+
+    init();
+  </script>
+</body>
+</html>
