@@ -63,6 +63,7 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 
 ## 📸 Preview
 
-<div align="center">
-<img width="353" height="464" alt="RustVision Interface Preview" src="[https://github.com/user-attachments/assets/48f9111b-732a-436a-a060-f370243c2aba](https://github.com/user-attachments/assets/48f9111b-732a-436a-a060-f370243c2aba)" />
-</div>
+
+
+https://github.com/user-attachments/assets/7495bcf7-fcdb-4c50-9f0c-7ffcbbd67c14
+
